@@ -1,4 +1,5 @@
-pandas
+python_version >= 3.10
+pandas>=2.2.2
 numpy
 scikit-learn
 xgboost
