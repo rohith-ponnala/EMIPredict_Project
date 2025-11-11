@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 💼 EMI Predict — End-to-End ML Project
 
 **Author:** Ponnala Rohith  
@@ -22,3 +23,7 @@ Python 3 · Pandas · Scikit-Learn · XGBoost · MLflow · Streamlit · Matplotl
 pip install -r requirements.txt
 streamlit run app.py
 
+=======
+# EMIPredict_Project
+End-to-End EMI Prediction System using ML, MLflow &amp; Streamlit
+>>>>>>> 5333f18e079b7a08acd107a111357072cbad4029
