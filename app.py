@@ -1,291 +1,436 @@
-# app.py — EMIPredict (multi-page streamlit app)
+# app.py -- Patched, defensive Streamlit app for EMIPredict
+# Author: generated patch for Ponnala Rohith
+# Requirements: streamlit, pandas, numpy, scikit-learn, joblib, plotly
+
 import streamlit as st
-import pandas as pd, numpy as np, joblib, json, os, webbrowser
 from pathlib import Path
+import pandas as pd
+import numpy as np
+import joblib
+import json
+import io
+import os
+import traceback
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Setup folders (assume repo root on Streamlit Cloud)
-BASE = Path.cwd()
-MODELS = BASE / "models"
-DATA = BASE / "data"
+# -------------------------
+# Paths & folders
+# -------------------------
+BASE = Path.cwd() / "EMIPredict_Project"  # not mandatory; runtime safe
+# fallback to repo root if present
+if not BASE.exists():
+    BASE = Path.cwd()
+DATA_DIR = BASE / "data"
+MODELS_DIR = BASE / "models"
 EDA_DIR = BASE / "eda_outputs"
-OUT = BASE / "outputs"
-MLRUNS = BASE / "mlruns"
+OUT_DIR = BASE / "outputs"
 
-# Page config
-st.set_page_config(page_title="EMIPredict", layout="wide", initial_sidebar_state="expanded")
+for d in (DATA_DIR, MODELS_DIR, EDA_DIR, OUT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-# Helpers
-def load_joblib_safe(p: Path):
+# -------------------------
+# Utilities: normalize columns, unique names
+# -------------------------
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim column names and make duplicates unique by suffixing _1, _2..."""
+    cols = [str(c).strip() for c in df.columns]
+    from collections import Counter
+    cnt = Counter(cols)
+    seen = Counter()
+    new = []
+    for c in cols:
+        if cnt[c] > 1:
+            seen[c] += 1
+            new.append(f"{c}_{seen[c]}")
+        else:
+            new.append(c)
+    df.columns = new
+    return df
+
+# -------------------------
+# Safe plotting helpers
+# -------------------------
+def safe_sample_df(df, n=5000, random_state=1):
+    n = min(max(1, int(n)), max(1, len(df)))
+    return df.sample(n=n, random_state=random_state).reset_index(drop=True).copy()
+
+def safe_scatter(df, xcol, ycol, color_col=None, sample_n=5000, height=450, title=None):
+    if xcol not in df.columns or ycol not in df.columns:
+        raise ValueError(f"Columns not found: {xcol}, {ycol}. Available: {list(df.columns)[:20]}")
+    d = safe_sample_df(df, sample_n)
+    # coerce numeric for x,y if possible
+    d[xcol] = pd.to_numeric(d[xcol], errors="coerce")
+    d[ycol] = pd.to_numeric(d[ycol], errors="coerce")
+    d = d.dropna(subset=[xcol, ycol]).reset_index(drop=True)
+    if d.shape[0] == 0:
+        raise ValueError("No rows left to plot after cleaning.")
+    if color_col and color_col in d.columns:
+        d[color_col] = d[color_col].astype(str).fillna("missing")
+        fig = px.scatter(d, x=xcol, y=ycol, color=color_col, title=title or f"{xcol} vs {ycol}", height=height)
+    else:
+        fig = px.scatter(d, x=xcol, y=ycol, title=title or f"{xcol} vs {ycol}", height=height)
+    return fig
+
+def safe_bar_counts(df, col, top_k=10, height=450, title=None):
+    if col not in df.columns:
+        raise ValueError(f"Column not found: {col}")
+    s = df[col].astype(str).value_counts().nlargest(top_k)
+    fig = go.Figure([go.Bar(x=s.index.astype(str), y=s.values)])
+    fig.update_layout(title=title or f"Counts of {col}", xaxis_title=col, yaxis_title="count", height=height)
+    return fig
+
+def save_fig(fig, name):
+    file = EDA_DIR / name
     try:
-        return joblib.load(p)
+        fig.write_image(str(file))
+    except Exception:
+        # fallback: write html
+        (EDA_DIR / (name.replace(".png", ".html"))).write_text(fig.to_html(full_html=False))
+    return file
+
+# -------------------------
+# Model loading / selection
+# -------------------------
+def find_model_file(kind="clf"):
+    """
+    Look for best_classifier.joblib / best_regressor.joblib or any *_clf/joblib.
+    Preference order: best_*, xgb_*, rf_*, logreg_* etc.
+    """
+    if kind == "clf":
+        pref = ["best_classifier", "xgb_clf", "xgb_clf.joblib", "xgb_clf.joblib", "xgb_clf.joblib", "logreg_clf", "rf_clf", "clf"]
+        suffixes = ["joblib", "pkl"]
+    else:
+        pref = ["best_regressor", "xgb_reg", "rf_reg", "lin_reg", "reg"]
+        suffixes = ["joblib", "pkl"]
+    # exact names first
+    for p in pref:
+        for suf in suffixes:
+            f = MODELS_DIR / f"{p}.{suf}"
+            if f.exists():
+                return f
+    # any matches
+    for f in MODELS_DIR.glob(f"*{kind}*.joblib"):
+        return f
+    for f in MODELS_DIR.glob(f"*{kind}*.pkl"):
+        return f
+    # try any joblib
+    candidates = list(MODELS_DIR.glob("*.joblib")) + list(MODELS_DIR.glob("*.pkl"))
+    return candidates[0] if candidates else None
+
+def load_label_encoder():
+    le_file = MODELS_DIR / "label_encoder.joblib"
+    if le_file.exists():
+        try:
+            return joblib.load(le_file)
+        except Exception:
+            return None
+    # fallback try json mapping
+    mapf = MODELS_DIR / "label_mapping.json"
+    if mapf.exists():
+        try:
+            mapping = json.loads(mapf.read_text())
+            # create dummy mapping object
+            class Dummy:
+                def __init__(self, m):
+                    self._m = m
+                    self.classes_ = [m[str(i)] for i in sorted(map(int, m.keys()))]
+                def inverse_transform(self, arr):
+                    return [self.classes_[int(x)] for x in arr]
+            return Dummy(mapping)
+        except Exception:
+            return None
+    return None
+
+def load_model(kind="clf"):
+    f = find_model_file(kind= "clf" if kind=="clf" else "reg")
+    if not f:
+        return None, None
+    try:
+        model = joblib.load(f)
+        return model, f.name
     except Exception as e:
-        return None
+        st.warning(f"Failed to load model {f.name}: {e}")
+        return None, None
 
-def load_json_safe(p: Path):
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+# -------------------------
+# App UI
+# -------------------------
+st.set_page_config(page_title="EMIPredict", layout="wide")
+st.title("EMIPredict — EMI Eligibility & Max EMI Prediction")
 
-def format_number(n):
-    try:
-        return f"{float(n):,.2f}"
-    except Exception:
-        return str(n)
-
-# Load models & label mapping when app starts
-clf_model = load_joblib_safe(MODELS / "best_classifier.joblib")
-reg_model = load_joblib_safe(MODELS / "best_regressor.joblib")
-label_map = load_json_safe(MODELS / "label_mapping.json") or {}
-label_encoder = None
-if (MODELS / "label_encoder.joblib").exists():
-    try:
-        label_encoder = joblib.load(MODELS / "label_encoder.joblib")
-    except Exception:
-        label_encoder = None
-
-# Sidebar navigation
-st.sidebar.title("EMIPredict")
+# sidebar nav
 page = st.sidebar.radio("Go to", ["Home", "Predict", "EDA", "Model Monitor", "Admin"])
 
-# -----------------------
+# Try load models at startup (non-blocking)
+clf_model, clf_name = load_model("clf")
+reg_model, reg_name = load_model("reg")
+label_enc = load_label_encoder()
+
+# -------------------------
 # Home
-# -----------------------
+# -------------------------
 if page == "Home":
-    st.title("EMIPredict — EMI Eligibility & Max EMI Prediction")
+    st.header("What this app does")
     st.markdown("""
-    **What this app does**
-    - Predict EMI eligibility (classification) and predicted max monthly EMI (regression).
-    - Interactive EDA and model monitoring pages.
+    - Predict EMI eligibility (classification) and maximum monthly EMI (regression).  
+    - Interactive EDA and model monitoring pages.  
     - Admin page to upload / replace models and dataset.
     """)
-    st.write("---")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Classifier loaded", "Yes" if clf_model else "No")
-    c2.metric("Regressor loaded", "Yes" if reg_model else "No")
-    c3.metric("Data available", "Yes" if (DATA / "processed_final.csv").exists() else "No")
-    st.markdown("**Quick start**: go to `Predict` to test, `EDA` to explore data, `Model Monitor` to see results.")
+    st.divider()
 
-# -----------------------
-# Predict (real-time)
-# -----------------------
-if page == "Predict":
-    st.header("Real-time prediction")
-    st.write("Enter applicant values below and hit Predict. The app will run the same preprocessing pipeline that the saved models expect (pipeline is embedded in joblib if saved with sklearn pipeline).")
+    st.subheader("Status")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Classifier loaded", "Yes" if clf_model is not None else "No")
+        if clf_model:
+            st.caption(f"file: {clf_name}")
+    with col2:
+        st.metric("Regressor loaded", "Yes" if reg_model is not None else "No")
+        if reg_model:
+            st.caption(f"file: {reg_name}")
+    with col3:
+        # check processed sample
+        sample = DATA_DIR / "processed_final.csv"
+        st.metric("Data available", "Yes" if sample.exists() else "No")
+        if sample.exists():
+            st.caption(f"{sample.name}")
 
-    # Load sample or processed features to auto-create inputs
-    proc = DATA / "processed_final.csv"
-    sample_df = None
-    if proc.exists():
-        try:
-            sample_df = pd.read_csv(proc, nrows=5)
-        except Exception:
-            sample_df = None
+    st.markdown("Quick start: go to **Predict** to test, **EDA** to explore data, **Model Monitor** to see results.")
 
-    # Determine numeric features to show (fallback set)
-    if sample_df is not None:
-        numeric_cols = sample_df.select_dtypes(include="number").columns.tolist()
-        default_features = numeric_cols[:8] if numeric_cols else ["monthly_salary","age","credit_score","current_emi_amount","requested_amount"]
-    else:
-        default_features = ["monthly_salary","age","credit_score","current_emi_amount","requested_amount"]
-
-    st.subheader("Input features")
-    cols = st.columns(4)
-    inputs = {}
-    for i, f in enumerate(default_features):
-        label = f.replace("_"," ").title()
-        default = float(sample_df[f].median()) if (sample_df is not None and f in sample_df.columns) else 0.0
-        # use sensible ranges for some known fields
-        if "age" in f.lower():
-            val = cols[i%4].number_input(label, min_value=18, max_value=100, value=int(default) if default else 30)
-        else:
-            val = cols[i%4].number_input(label, value=float(default))
-        inputs[f] = val
-
-    st.write("Optional: Paste a JSON row to predict many at once (one JSON object per line).")
-    multi_text = st.text_area("Batch JSON (optional)", height=80)
-    do_batch = bool(multi_text.strip())
-
-    if st.button("Predict"):
-        if clf_model is None or reg_model is None:
-            st.error("Models not loaded — place `best_classifier.joblib` and `best_regressor.joblib` in models/")
-        else:
-            try:
-                if do_batch:
-                    # parse lines into dataframe
-                    rows = [json.loads(line) for line in multi_text.strip().splitlines() if line.strip()]
-                    X = pd.DataFrame(rows)
-                else:
-                    X = pd.DataFrame([inputs])
-                # predictions
-                clf_preds = clf_model.predict(X)
-                reg_preds = reg_model.predict(X).astype(float)
-
-                # map classification back to labels
-                def decode_label(v):
-                    s = str(int(v)) if (isinstance(v,(int,np.integer)) or (isinstance(v,str) and v.isdigit())) else str(v)
-                    if s in label_map:
-                        return label_map[s]
-                    try:
-                        if label_encoder is not None:
-                            return label_encoder.inverse_transform([v])[0]
-                    except Exception:
-                        pass
-                    return str(v)
-
-                if len(X) == 1:
-                    st.success(f"EMI Eligibility → **{decode_label(clf_preds[0])}**")
-                    st.info(f"Predicted max monthly EMI → **{format_number(reg_preds[0])}**")
-                else:
-                    out = X.copy()
-                    out["pred_eligibility"] = [decode_label(p) for p in clf_preds]
-                    out["pred_max_monthly_emi"] = reg_preds
-                    st.write(out)
-            except Exception as e:
-                st.error("Prediction failed — likely feature mismatch. Error: " + str(e))
-                st.write("Tip: ensure the model pipeline's feature names/types match. Use Admin to upload a compatible processed_final.csv sample.")
-
-# -----------------------
-# EDA (interactive visualizations)
-# -----------------------
-if page == "EDA":
-    st.header("Interactive EDA")
-    proc = DATA / "processed_final.csv"
-    if not proc.exists():
-        st.warning("processed_final.csv not found in data/. Run notebook preprocessing.")
-    else:
-        df = pd.read_csv(proc, low_memory=False)
-        st.markdown(f"Dataset: {proc.name} — rows: {len(df):,}, columns: {df.shape[1]}")
-        # Quick summary
-        with st.expander("Show data sample"):
-            st.dataframe(df.sample(min(200, len(df))).reset_index(drop=True))
-
-        # Interactive widgets for EDA
-        numeric_cols = df.select_dtypes(include="number").columns.tolist()
-        cat_cols = df.select_dtypes(include="object").columns.tolist()
-
-        st.subheader("1. Numeric scatter / correlation explorer")
-        colx, coly = st.columns(2)
-        xcol = colx.selectbox("X axis", numeric_cols, index=0)
-        ycol = coly.selectbox("Y axis", numeric_cols, index=1 if len(numeric_cols)>1 else 0)
-        fig = px.scatter(df.sample(min(5000,len(df))), x=xcol, y=ycol, color=df['emi_eligibility'] if 'emi_eligibility' in df.columns else None,
-                         title=f"{xcol} vs {ycol}", height=450)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("2. Correlation heatmap (top numeric columns)")
-        if len(numeric_cols) > 1:
-            topn = st.slider("Top N numeric columns", min_value=5, max_value=min(30,len(numeric_cols)), value=min(12,len(numeric_cols)))
-            top_vars = df[numeric_cols].var().sort_values(ascending=False).head(topn).index.tolist()
-            corr = df[top_vars].corr()
-            fig2 = px.imshow(corr, text_auto=False, title="Correlation heatmap")
-            st.plotly_chart(fig2, use_container_width=True)
-
-        st.subheader("3. Categorical counts by target")
-        if cat_cols and 'emi_eligibility' in df.columns:
-            cat = st.selectbox("Categorical column", [c for c in cat_cols if df[c].nunique() < 50], index=0)
-            tab = pd.crosstab(df[cat], df['emi_eligibility'], normalize='index')
-            fig3 = px.bar(df.sample(min(20000,len(df))).groupby([cat,'emi_eligibility']).size().reset_index(name='count'),
-                          x=cat, y='count', color='emi_eligibility', title=f"{cat} by EMI eligibility")
-            st.plotly_chart(fig3, use_container_width=True)
-
-        # show saved EDA PNGs as fallback/documents
-        st.subheader("Saved EDA images")
-        if EDA_DIR.exists():
-            images = sorted(list(EDA_DIR.glob("*.png")))
-            if images:
-                for im in images:
-                    st.image(str(im), caption=im.name, use_column_width=True)
-            else:
-                st.info("No saved EDA PNGs found in eda_outputs/")
-
-# -----------------------
-# Model Monitor & MLflow
-# -----------------------
-if page == "Model Monitor":
-    st.header("Model performance & MLflow")
-    # show outputs JSON
-    st.subheader("Model results (outputs/)")
-    clf_out = OUT / "classification_results.json"
-    reg_out = OUT / "regression_results.json"
-    if clf_out.exists():
-        try:
-            cr = load_json_safe(clf_out)
-            dfc = pd.DataFrame(cr)
-            st.write("Classification summary:")
-            st.dataframe(dfc)
-            # small bar chart f1 & accuracy
-            st.plotly_chart(px.bar(dfc, x='name', y=['accuracy','f1'], barmode='group', title="Classifier metrics"), use_container_width=True)
-        except Exception as e:
-            st.write("Failed to read classification_results.json:", e)
-    else:
-        st.info("No classification_results.json found (run notebook training).")
-
-    if reg_out.exists():
-        try:
-            rr = load_json_safe(reg_out)
-            dfr = pd.DataFrame(rr)
-            st.write("Regression summary:")
-            st.dataframe(dfr)
-            st.plotly_chart(px.bar(dfr, x='name', y=['RMSE','MAE'], barmode='group', title="Regressor metrics"), use_container_width=True)
-        except Exception as e:
-            st.write("Failed to read regression_results.json:", e)
-    else:
-        st.info("No regression_results.json found (run notebook training).")
-
-    st.subheader("MLflow runs (if mlruns/ present)")
-    if MLRUNS.exists():
-        # list experiments by reading mlruns dir (simple)
-        exps = [p.name for p in MLRUNS.iterdir() if p.is_dir()]
-        st.write("Detected mlruns experiments:", exps)
-        st.markdown("**Open MLflow UI (if you have an MLflow server running)**")
-        mlflow_ui_url = st.text_input("MLflow UI URL (e.g., http://<host>:5000)", value="")
-        if mlflow_ui_url:
-            if st.button("Open MLflow UI"):
-                try:
-                    webbrowser.open(mlflow_ui_url)
-                    st.success("Opening MLflow UI in new tab (if allowed by environment).")
-                except Exception:
-                    st.write("Please open the URL manually:", mlflow_ui_url)
-    else:
-        st.info("mlruns/ not found. MLflow logs are saved in the notebook folder when training. To see MLflow UI, run the notebook and start `mlflow ui` with backend-store pointing at mlruns/")
-
-# -----------------------
-# Admin
-# -----------------------
-if page == "Admin":
-    st.header("Admin: upload models / dataset / housekeeping")
-    st.markdown("Use this page to upload models or a processed sample dataset, or to remove older models to save space.")
-    st.subheader("Upload models (joblib)")
-    uploaded = st.file_uploader("Upload one or more joblib files (classifier/regressor/encoder/json)", accept_multiple_files=True)
+# -------------------------
+# Predict
+# -------------------------
+elif page == "Predict":
+    st.header("Predict — test single records")
+    st.write("Upload a processed sample (processed_final.csv) or use the form below to input features.")
+    sample_file = DATA_DIR / "processed_final.csv"
+    uploaded = st.file_uploader("Optional: upload processed_final.csv (used to auto-fill fields)", type=["csv"])
+    df_sample = None
     if uploaded:
-        for uf in uploaded:
-            dest = MODELS / uf.name
-            with open(dest, "wb") as f:
-                f.write(uf.getbuffer())
-            st.success(f"Saved {uf.name} → models/")
-    st.write("---")
+        try:
+            df_sample = pd.read_csv(uploaded)
+            df_sample = normalize_columns(df_sample)
+            st.success("Sample loaded")
+        except Exception as e:
+            st.error(f"Failed to read uploaded CSV: {e}")
+
+    if df_sample is not None:
+        cols = df_sample.columns.tolist()
+    else:
+        # fallback sample columns (best-effort)
+        cols = ["age", "monthly_salary", "bank_balance", "credit_score", "current_emi_amount", "employment_years"]
+
+    with st.form("predict_form"):
+        st.write("Provide input values (leave as default if unknown):")
+        inputs = {}
+        for c in cols:
+            # numeric guess
+            if any(k in c.lower() for k in ["age","salary","balance","emi","credit","amount","years"]):
+                inputs[c] = st.number_input(c, value=float(df_sample[c].iloc[0]) if (df_sample is not None and c in df_sample.columns and pd.api.types.is_numeric_dtype(df_sample[c])) else 0.0)
+            else:
+                inputs[c] = st.text_input(c, value=str(df_sample[c].iloc[0]) if (df_sample is not None and c in df_sample.columns) else "")
+        submitted = st.form_submit_button("Predict")
+    if submitted:
+        X = pd.DataFrame([inputs])
+        # Normalize names as app expects
+        X = normalize_columns(X)
+        # ensure types
+        for col in X.select_dtypes(include="object").columns:
+            X[col] = X[col].astype(str)
+        # Classification
+        if clf_model is not None:
+            try:
+                pred = clf_model.predict(X)
+                if label_enc is not None:
+                    try:
+                        pred_label = label_enc.inverse_transform(pred if hasattr(pred, "__iter__") else [pred])[0]
+                    except Exception:
+                        # if label_enc expects strings
+                        pred_label = str(pred[0]) if hasattr(pred, "__iter__") else str(pred)
+                else:
+                    pred_label = str(pred[0]) if hasattr(pred, "__iter__") else str(pred)
+                st.success(f"Classifier prediction: {pred_label}")
+            except Exception as e:
+                st.error(f"Classifier predict error: {e}\n{traceback.format_exc()}")
+        else:
+            st.info("No classifier found. Upload on Admin page.")
+        # Regression
+        if reg_model is not None:
+            try:
+                rpred = reg_model.predict(X)
+                st.success(f"Predicted max monthly EMI: {float(rpred[0]):.2f}")
+            except Exception as e:
+                st.error(f"Regressor predict error: {e}\n{traceback.format_exc()}")
+        else:
+            st.info("No regressor found. Upload on Admin page.")
+
+# -------------------------
+# EDA
+# -------------------------
+elif page == "EDA":
+    st.header("Exploratory Data Analysis (5 charts)")
+    # Load processed sample (either uploaded previously or existing data)
+    proc = DATA_DIR / "processed_final.csv"
+    if not proc.exists():
+        st.warning("No processed_final.csv found in data/. Upload a sample via Admin or push to repo.")
+    else:
+        try:
+            df = pd.read_csv(proc, low_memory=False)
+            df = normalize_columns(df)
+        except Exception as e:
+            st.error(f"Failed to load processed_final.csv: {e}")
+            df = None
+
+    if df is not None:
+        # 1) Eligibility distribution (if present)
+        try:
+            if "emi_eligibility" in df.columns:
+                fig1 = safe_bar_counts(df, "emi_eligibility", top_k=10, title="EMI eligibility distribution")
+                st.plotly_chart(fig1, use_container_width=True)
+                save_fig(fig1, "eda_eligibility_distribution.png")
+            else:
+                st.info("Column 'emi_eligibility' not in dataset.")
+        except Exception as e:
+            st.error(f"Chart 1 error: {e}")
+
+        # 2) Correlation heatmap of top numeric features
+        try:
+            num = df.select_dtypes(include=[np.number]).copy()
+            if num.shape[1] > 1:
+                corr = num.corr().abs()
+                # reduce to top 12 variables
+                top_vars = corr.var().sort_values(ascending=False).head(12).index.tolist()
+                fig2 = px.imshow(num[top_vars].corr(), title="Top numeric correlation (abs)", height=600)
+                st.plotly_chart(fig2, use_container_width=True)
+                save_fig(fig2, "eda_correlation.png")
+            else:
+                st.info("Not enough numeric columns for correlation.")
+        except Exception as e:
+            st.error(f"Chart 2 error: {e}")
+
+        # 3) Age KDE / distribution by eligibility (if present)
+        try:
+            if "age" in df.columns:
+                d = df.copy()
+                d["age"] = pd.to_numeric(d["age"], errors="coerce").fillna(-1)
+                # use histogram with color
+                if "emi_eligibility" in df.columns:
+                    fig3 = px.histogram(d[d["age"]>=0], x="age", color="emi_eligibility", nbins=40, title="Age distribution by EMI eligibility")
+                else:
+                    fig3 = px.histogram(d[d["age"]>=0], x="age", nbins=40, title="Age distribution")
+                st.plotly_chart(fig3, use_container_width=True)
+                save_fig(fig3, "eda_age_dist.png")
+            else:
+                st.info("Column 'age' not present")
+        except Exception as e:
+            st.error(f"Chart 3 error: {e}")
+
+        # 4) Credit score vs max_monthly_emi scatter (if columns present)
+        try:
+            if set(["credit_score","max_monthly_emi"]).issubset(df.columns):
+                fig4 = safe_scatter(df, xcol="credit_score", ycol="max_monthly_emi", color_col="emi_eligibility" if "emi_eligibility" in df.columns else None, sample_n=5000, title="Credit score vs predicted max EMI")
+                st.plotly_chart(fig4, use_container_width=True)
+                save_fig(fig4, "eda_credit_vs_emi.png")
+            else:
+                st.info("Need 'credit_score' and 'max_monthly_emi' for chart 4")
+        except Exception as e:
+            st.error(f"Chart 4 error: {e}")
+
+        # 5) Monthly salary vs bank_balance scatter
+        try:
+            if set(["monthly_salary","bank_balance"]).issubset(df.columns):
+                fig5 = safe_scatter(df, xcol="monthly_salary", ycol="bank_balance", sample_n=5000, title="Salary vs bank balance")
+                st.plotly_chart(fig5, use_container_width=True)
+                save_fig(fig5, "eda_salary_balance.png")
+            else:
+                st.info("Need 'monthly_salary' and 'bank_balance' for chart 5")
+        except Exception as e:
+            st.error(f"Chart 5 error: {e}")
+
+        st.success(f"EDA charts saved to {EDA_DIR.resolve()} (PNG or HTML fallback).")
+
+# -------------------------
+# Model Monitor
+# -------------------------
+elif page == "Model Monitor":
+    st.header("Model performance & MLflow (outputs/)")
+    # show classification_results.json
+    cr = OUT_DIR / "classification_results.json"
+    rr = OUT_DIR / "regression_results_fast.json"
+    if cr.exists():
+        try:
+            dfc = pd.read_json(cr)
+            st.subheader("Classification summary:")
+            st.dataframe(dfc)
+            # small bar chart of accuracy/f1
+            if not dfc.empty:
+                mdf = dfc.melt(id_vars=["name"], value_vars=[c for c in ["accuracy","f1"] if c in dfc.columns], var_name="metric", value_name="value")
+                fig = px.bar(mdf, x="name", y="value", color="metric", barmode="group", title="Classifier metrics")
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Failed to read classification_results.json: {e}")
+    else:
+        st.info("No classification_results.json found (run training notebook and upload outputs/)")
+
+    if rr.exists():
+        try:
+            dfr = pd.read_json(rr)
+            st.subheader("Regression summary:")
+            st.dataframe(dfr)
+        except Exception as e:
+            st.error(f"Failed to read regression_results_fast.json: {e}")
+    else:
+        st.info("No regression_results_fast.json found (run training notebook and upload outputs/)")
+
+    # mlruns presence
+    if (BASE / "mlruns").exists():
+        st.success("mlruns/ present. Use MLflow UI to explore.")
+    else:
+        st.info("mlruns/ not found. MLflow logs are saved in the notebook folder when training. To see MLflow UI, run the notebook and start mlflow ui with backend-store pointing at mlruns/")
+
+# -------------------------
+# Admin
+# -------------------------
+elif page == "Admin":
+    st.header("Admin: upload models / dataset / housekeeping")
+    st.write("Use this page to upload models (joblib), processed samples (processed_final.csv) or to cleanup older models.")
+
+    st.subheader("Upload models (joblib)")
+    uploaded_models = st.file_uploader("Upload joblib model files (classifier/regressor/encoder/json)", accept_multiple_files=True)
+    if uploaded_models:
+        for f in uploaded_models:
+            try:
+                dest = MODELS_DIR / f.name
+                bytes_data = f.read()
+                dest.write_bytes(bytes_data)
+                st.success(f"Saved {f.name} to {MODELS_DIR}")
+            except Exception as e:
+                st.error(f"Failed to save {f.name}: {e}")
+
     st.subheader("Upload processed sample (processed_final.csv)")
-    uploaded_data = st.file_uploader("Upload processed_final.csv", type=["csv"])
+    uploaded_data = st.file_uploader("Upload processed_final.csv (used by EDA & predict)", type=["csv"], key="data_upload")
     if uploaded_data:
-        dest = DATA / "processed_final.csv"
-        with open(dest, "wb") as f:
-            f.write(uploaded_data.getbuffer())
-        st.success("Saved processed_final.csv to data/")
-    st.write("---")
-    st.subheader("Cleanup old models (keep only best files)")
-    if st.button("Cleanup models folder (keep best_classifier, best_regressor, label_encoder, label_mapping)"):
-        keep = {"best_classifier.joblib","best_regressor.joblib","label_encoder.joblib","label_mapping.json"}
+        try:
+            dest = DATA_DIR / "processed_final.csv"
+            dest.write_bytes(uploaded_data.read())
+            st.success("Saved processed_final.csv")
+        except Exception as e:
+            st.error(f"Failed to save processed_final.csv: {e}")
+
+    st.subheader("Cleanup old models")
+    if st.button("Keep only best_{classifier,regressor,label_encoder,label_mapping}"):
         removed = []
-        for f in MODELS.glob("*"):
-            if f.name not in keep:
+        keep_names = {"best_classifier.joblib", "best_regressor.joblib", "label_encoder.joblib", "label_mapping.json"}
+        for f in MODELS_DIR.iterdir():
+            if f.is_file() and f.name not in keep_names:
                 try:
                     f.unlink()
                     removed.append(f.name)
                 except Exception:
                     pass
-        st.write("Removed files:", removed)
-        st.success("Cleanup done.")
-    st.write("---")
-    st.info("Tip: For production, store models in S3 or MLflow registry instead of committing large joblib to GitHub.")
+        st.write("Removed:", removed or "Nothing to remove")
+
+    st.markdown("Tip: For production, store models in S3 or MLflow registry instead of committing large joblib files to GitHub.")
+
+# End of app
