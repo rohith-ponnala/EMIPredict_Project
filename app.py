@@ -1,285 +1,245 @@
 # app.py
-"""
-Patched EMIPredict app.py - robust input harmonization + safe prediction.
-
-Instructions:
- - Put this file in your project root (where models/ and data/ folders live).
- - Ensure the joblib model files are present:
-     models/best_classifier.joblib
-     models/best_regressor.joblib
-     models/label_encoder.joblib  (optional)
- - Run locally: `streamlit run app.py`
-"""
-
-import sys
+# Patched EMIPredict Streamlit app (robust input handling + missing-column fixes)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import joblib
+import json
+import os
 import traceback
-import warnings
 from pathlib import Path
 
-import joblib
-import numpy as np
-import pandas as pd
-import streamlit as st
-
-# suppress sklearn version compatibility noisy warnings in UI (they're safe here)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# --- Tweak these ---
-BASE = Path(".")
+# --- Config
+BASE = Path.cwd()
 MODELS_DIR = BASE / "models"
+OUT_DIR = BASE / "outputs"
 DATA_DIR = BASE / "data"
-CLASSIFIER_FNAME = MODELS_DIR / "best_classifier.joblib"
-REGRESSOR_FNAME = MODELS_DIR / "best_regressor.joblib"
-LABEL_ENCODER_FNAME = MODELS_DIR / "label_encoder.joblib"  # optional
-# List of columns the trained pipeline expects (use the one you trained with)
-# This list should reflect your processed_final.csv column names exactly.
-EXPECTED_COLUMNS = [
-    "school_fees", "house_type", "years_of_employment", "requested_amount", "dependents",
-    "groceries_utilities", "existing_loans", "gender", "employment_type", "college_fees",
-    "other_monthly_expenses", "max_monthly_emi", "emergency_fund", "emi_scenario",
-    "travel_expenses", "education", "monthly_rent", "marital_status", "family_size",
-    "requested_tenure", "company_type", "age", "monthly_salary", "bank_balance",
-    "credit_score", "current_emi_amount", "employment_years", "requested_tenure"  # duplicate ok
-]
-# Default values to fill missing features for single-record prediction (safe defaults)
-DEFAULT_INPUTS = {
-    "age": 30, "monthly_salary": 50000, "bank_balance": 300000, "credit_score": 700,
-    "current_emi_amount": 0, "employment_years": 1, "requested_tenure": 12,
-    # categorical defaults
-    "gender": "Male", "education": "Graduate", "employment_type": "Salaried",
-    "marital_status": "Single", "company_type": "Private", "house_type": "Owned",
-    # numeric extras
-    "requested_amount": 100000, "max_monthly_emi": 0, "dependents": 0,
-    "groceries_utilities": 0, "other_monthly_expenses": 0, "monthly_rent": 0,
-    "school_fees": 0, "college_fees": 0, "existing_loans": 0, "emergency_fund": 0,
-    "travel_expenses": 0, "family_size": 1, "requested_tenure": 12, "emi_scenario": "Eligible"
-}
-# --------------------
+CLASSIFIER_PATH = MODELS_DIR / "best_classifier.joblib"
+REGRESSOR_PATH = MODELS_DIR / "best_regressor.joblib"
+LABEL_MAP = MODELS_DIR / "label_mapping.json"
+FEATURES_JSON = MODELS_DIR / "feature_names.json"  # optional helper file if present
 
-st.set_page_config(page_title="EMIPredict — EMI Eligibility & Max EMI", layout="wide")
+st.set_page_config(page_title="EMIPredict", layout="wide")
 
-# --- Utilities ----------------------------------------------------------------
 
-def safe_load_joblib(path: Path):
-    if not path.exists():
-        return None
+# --- Utility helpers -------------------------------------------------------
+def safe_load_joblib(p):
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            obj = joblib.load(path)
-        return obj
+        return joblib.load(p)
     except Exception as e:
-        st.warning(f"Failed to load {path.name}: {e}")
+        st.warning(f"Failed to load model {p}: {e}")
+        st.exception(e)
         return None
 
-def _get_column_transformer_steps(model):
-    """
-    Recursively find ColumnTransformer.transformers_ inside pipelines and return list of
-    (name, transformer, columns).
-    """
-    from sklearn.compose import ColumnTransformer
-    out = []
-    def search(obj):
-        # pipeline-like objects:
-        if hasattr(obj, "named_steps"):
-            for step in obj.named_steps.values():
-                search(step)
-        if hasattr(obj, "steps"):
-            for _, step in obj.steps:
-                search(step)
-        if isinstance(obj, ColumnTransformer):
-            # transformers_ is a list of (name, transformer, columns)
-            out.extend(obj.transformers_)
-    search(model)
-    return out
 
-def harmonize_input_dtypes(X: pd.DataFrame, model) -> pd.DataFrame:
+def get_expected_columns_from_pipeline(pipe):
     """
-    Cast columns of X to types compatible with fitted transformers in model.
-    - For OneHotEncoder categories that are strings, cast incoming column to str
-      (and fillna with empty string).
-    - For numeric categories, cast to numeric (coerce -> NaN).
-    - Also attempt safe numeric conversions for columns that look numeric.
+    Attempt several ways to extract the expected input feature names/order
+    from a fitted sklearn pipeline/column transformer. Returns list or None.
     """
-    import numbers
-    from sklearn.preprocessing import OneHotEncoder
-
-    if model is None:
-        return X.copy()
-    X = X.copy()
-
+    if pipe is None:
+        return None
     try:
-        transformers = _get_column_transformer_steps(model)
+        # If pipeline has named_steps with a ColumnTransformer
+        if hasattr(pipe, "named_steps"):
+            for name, step in pipe.named_steps.items():
+                # ColumnTransformer common name 'columntransformer' or 'preprocessor'
+                if step.__class__.__name__.lower().startswith("columntransf"):
+                    # try feature_names_in_
+                    if hasattr(step, "feature_names_in_"):
+                        return list(getattr(step, "feature_names_in_"))
+                    # try get_feature_names_out (ColumnTransformer + sklearn>=1.0)
+                    try:
+                        out = step.get_feature_names_out()
+                        if isinstance(out, (list, np.ndarray)):
+                            return list(out)
+                    except Exception:
+                        pass
+                    # else try transformer's feature_names_in_
+                    # fall back to concatenating transformer feature input names
+                    cols = []
+                    try:
+                        for transformer_name, transformer, columns in step.transformers_:
+                            # columns can be list of names or slice
+                            if isinstance(columns, (list, tuple, np.ndarray)):
+                                cols.extend(list(columns))
+                            elif isinstance(columns, str):
+                                cols.append(columns)
+                    except Exception:
+                        pass
+                    if cols:
+                        return cols
+        # otherwise try pipeline.feature_names_in_ (scikit-learn 1.0+)
+        if hasattr(pipe, "feature_names_in_"):
+            return list(getattr(pipe, "feature_names_in_"))
     except Exception:
-        return X
+        pass
+    return None
 
-    # Process each transformer set
-    for name, transformer, cols in transformers:
-        if transformer is None or transformer == "drop" or transformer == "passthrough":
-            continue
-        # Get the actual encoder step if pipeline
-        t = transformer
+
+def load_feature_list_from_json(path):
+    if path.exists():
         try:
-            # pipeline -> get last estimator
-            if hasattr(t, "named_steps"):
-                vals = list(t.named_steps.values())
-                if vals:
-                    t = vals[-1]
-            elif hasattr(t, "steps"):
-                vals = [s for _, s in t.steps]
-                if vals:
-                    t = vals[-1]
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
         except Exception:
             pass
+    return None
 
-        # Handle OneHotEncoder-like
-        if hasattr(t, "categories_") or t.__class__.__name__ == "OneHotEncoder":
-            cats = getattr(t, "categories_", None)
-            # ensure cols is list-like
-            if not isinstance(cols, (list, tuple)):
-                continue
-            for i, col in enumerate(cols):
-                if col not in X.columns:
-                    continue
-                # if categories found, inspect dtype
-                if cats is not None and i < len(cats):
-                    cat_vals = cats[i]
-                    # detect if categories contain strings or numbers
-                    has_str = any(isinstance(v, str) for v in cat_vals)
-                    has_num = all(isinstance(v, (numbers.Number, np.integer, np.floating)) or v is None or (isinstance(v, float) and np.isnan(v)) for v in cat_vals)
-                    if has_str and not has_num:
-                        # cast to string
-                        X[col] = X[col].astype(str).fillna("")
-                    elif has_num and not has_str:
-                        X[col] = pd.to_numeric(X[col], errors="coerce")
-                    else:
-                        # mixed or unknown, cast to str as safe default
-                        X[col] = X[col].astype(str).fillna("")
-                else:
-                    # No categories info - make conservative choices:
-                    # If column currently numeric-like, coerce numeric, else cast str
-                    if pd.api.types.is_numeric_dtype(X[col]):
-                        X[col] = pd.to_numeric(X[col], errors="coerce")
-                    else:
-                        X[col] = X[col].astype(str).fillna("")
-    # small heuristic: coerce columns with numeric-looking names to numeric
-    maybe_numeric_suffix = ("age","salary","amount","emi","balance","score","years","tenure","rent")
-    for c in X.columns:
-        if any(c.lower().endswith(suf) for suf in maybe_numeric_suffix) or any(suf in c.lower() for suf in ("monthly","requested","current","max_")):
-            X[c] = pd.to_numeric(X[c], errors="coerce")
-    return X
 
-def ensure_columns_for_predict(X: pd.DataFrame, expected_columns, defaults=None) -> pd.DataFrame:
+def prepare_input_dataframe(user_df, expected_cols, column_types_hint=None):
     """
-    Ensure X contains all expected_columns. If columns are missing, add them
-    with default values from defaults dict or NaN.
-    Returns DataFrame with columns in expected_columns order (plus extras).
+    Ensure the DataFrame has all expected_cols. For missing columns add defaults:
+    - numeric -> 0
+    - categorical -> 'missing'
+    If we have a hint of which columns are numeric/categorical (column_types_hint dict),
+    use it. Otherwise we try to infer from current user_df / expected patterns.
+    Returns a DataFrame with columns in expected order and safe dtypes.
     """
-    X = X.copy()
-    defaults = defaults or {}
-    for col in expected_columns:
-        if col not in X.columns:
-            if col in defaults:
-                X[col] = defaults[col]
+    df = user_df.copy(deep=True)
+    # Coerce everything to consistent representation first:
+    # For any column present, coerce numeric-like to numeric
+    for c in df.columns:
+        # if column_types_hint says numeric, coerce numeric
+        try:
+            if column_types_hint and column_types_hint.get(c) == "numeric":
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
             else:
-                X[col] = np.nan
-    # keep extra columns if present
-    return X
+                # Try to coerce numeric to numeric if mostly numeric
+                temp = pd.to_numeric(df[c], errors="coerce")
+                non_na_ratio = temp.notna().sum() / max(1, len(temp))
+                if non_na_ratio >= 0.7:
+                    df[c] = temp.fillna(0)
+                else:
+                    # treat as categorical: convert to string and fill missing
+                    df[c] = df[c].astype(str).fillna("missing")
+        except Exception:
+            df[c] = df[c].astype(str).fillna("missing")
 
-# --- Load models --------------------------------------------------------------
+    # For missing columns, add defaults
+    added = []
+    for c in expected_cols:
+        if c not in df.columns:
+            # default numeric? try to guess by name heuristics
+            if column_types_hint and column_types_hint.get(c) == "numeric":
+                df[c] = 0
+            elif any(k in c.lower() for k in ("amount", "salary", "balance", "score", "emi", "rent", "fees", "age", "years", "depend", "size", "tenure")):
+                df[c] = 0
+            else:
+                df[c] = "missing"
+            added.append(c)
 
-clf_model = safe_load_joblib(CLASSIFIER_FNAME)
-reg_model = safe_load_joblib(REGRESSOR_FNAME)
-label_encoder = safe_load_joblib(LABEL_ENCODER_FNAME)
+    # Reorder columns exactly as expected
+    df = df[[c for c in expected_cols]]
 
-# --- UI ----------------------------------------------------------------------
+    # Final safety pass: numeric columns -> numeric
+    # If we have hints, enforce numeric where indicated
+    if column_types_hint:
+        for c, tp in column_types_hint.items():
+            if c in df.columns and tp == "numeric":
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-st.title("EMIPredict — EMI Eligibility & Max EMI Prediction")
+    # Convert object dtype categorical columns to string to avoid isnan errors
+    for c in df.select_dtypes(include=["object"]).columns:
+        df[c] = df[c].astype(str).fillna("missing")
 
-col1, col2 = st.columns([1, 3])
-with col1:
-    st.header("Quick actions")
-    st.markdown("- Upload `processed_final.csv` (optional).")
-    st.markdown("- Fill the form and click Predict.")
-    st.markdown("- If models missing, upload them to `models/` folder.")
+    return df, added
 
-with col2:
-    if clf_model is None:
-        st.warning("Classifier not loaded. Place models/best_classifier.joblib in repo.")
-    else:
-        st.success("Classifier loaded")
-    if reg_model is None:
-        st.warning("Regressor not loaded. Place models/best_regressor.joblib in repo.")
-    else:
-        st.success("Regressor loaded")
-    if label_encoder is None:
-        st.info("Label encoder not found (optional).")
 
-st.markdown("---")
-st.header("Predict — test single or upload sample")
+# --- Load models & get expected features ----------------------------------
+st.title("EMIPredict — EMI Eligibility & Max EMI Prediction (patched)")
 
-uploaded = st.file_uploader("Upload processed_final.csv (optional, will prefill inputs)", type=["csv"])
-if uploaded is not None:
-    sample_df = pd.read_csv(uploaded)
-    # Take first row as default
-    if not sample_df.empty:
-        sample_row = sample_df.iloc[0].to_dict()
-    else:
-        sample_row = {}
+clf_model = safe_load_joblib(CLASSIFIER_PATH) if CLASSIFIER_PATH.exists() else None
+reg_model = safe_load_joblib(REGRESSOR_PATH) if REGRESSOR_PATH.exists() else None
+
+# Try to get expected columns from pipeline / fallback to JSON file
+expected_cols_clf = get_expected_columns_from_pipeline(clf_model) if clf_model else None
+expected_cols_reg = get_expected_columns_from_pipeline(reg_model) if reg_model else None
+
+# If not found, try JSON file
+if expected_cols_clf is None:
+    expected_cols_clf = load_feature_list_from_json(MODELS_DIR / "clf_feature_names.json") or load_feature_list_from_json(FEATURES_JSON)
+if expected_cols_reg is None:
+    expected_cols_reg = load_feature_list_from_json(MODELS_DIR / "reg_feature_names.json") or load_feature_list_from_json(FEATURES_JSON)
+
+# If both still None but one model exists, try unify
+if expected_cols_clf is None and expected_cols_reg is not None:
+    expected_cols_clf = expected_cols_reg
+if expected_cols_reg is None and expected_cols_clf is not None:
+    expected_cols_reg = expected_cols_clf
+
+# Minimal UI and dataset input
+st.markdown("### Predict — test single records")
+st.info("Enter values below to predict (no file required). If you want exact inference matching training, upload processed_final.csv used during training on Admin page.")
+
+# Build a simple form automatically from expected_cols_clf/reg or fallback to a compact default set.
+# If we don't have expected cols at all, present a basic manual form for numeric core features.
+DEFAULT_FIELDS = [
+    "age", "gender", "monthly_salary", "bank_balance", "credit_score",
+    "requested_amount", "requested_tenure", "current_emi_amount", "employment_type"
+]
+
+form = st.form("predict_form")
+# choose field list:
+field_list = expected_cols_clf if expected_cols_clf is not None else (expected_cols_reg if expected_cols_reg is not None else DEFAULT_FIELDS)
+
+# Limit fields shown to a reasonable number (if huge), but allow user to upload processed CSV for full
+if len(field_list) > 80:
+    st.warning("Detected a large number of features. The form will show a compact set; upload processed_final.csv on Admin for full automatic input.")
+    # choose top defaults instead:
+    visible_fields = DEFAULT_FIELDS
 else:
-    sample_row = {}
+    visible_fields = field_list
 
-# build input form
-st.subheader("Provide input values (leave as default if unknown)")
-input_data = {}
-# use expected columns but show subset: numeric primary fields + some categorical
-form = st.form("input_form")
-# numeric fields
-num_fields = ["age", "monthly_salary", "bank_balance", "credit_score", "current_emi_amount", "employment_years", "requested_amount", "requested_tenure"]
-for f in num_fields:
-    default = sample_row.get(f, DEFAULT_INPUTS.get(f, np.nan))
-    # ensure numeric default
-    try:
-        default = float(default) if pd.notna(default) else DEFAULT_INPUTS.get(f, np.nan)
-    except Exception:
-        default = DEFAULT_INPUTS.get(f, np.nan)
-    input_data[f] = form.number_input(f, value=float(default) if not pd.isna(default) else 0.0, format="%.2f")
+# Prepare a dict to collect inputs
+input_values = {}
+col1, col2 = st.columns([1, 1])
+with form:
+    # render each visible field with best widget selection heuristics
+    for f in visible_fields:
+        key = f"input_{f}"
+        fname = f.replace("_", " ").capitalize()
+        if any(k in f for k in ("gender", "marital", "company", "education", "employment", "house_type", "emi_scenario")):
+            input_values[f] = st.selectbox(fname, options=["missing", "Male", "Female", "Other", "Private", "Public", "Self-employed", "Married", "Single"], key=key)
+        elif any(k in f for k in ("depend", "family_size", "years", "tenure", "age")):
+            input_values[f] = st.number_input(fname, value=0.0, step=1.0, key=key)
+        else:
+            # default numeric widget
+            input_values[f] = st.number_input(fname, value=0.0, step=1.0, key=key)
 
-# categorical quick fields
-cat_fields = ["gender", "education", "employment_type", "marital_status", "company_type", "house_type", "emi_scenario"]
-for f in cat_fields:
-    defv = sample_row.get(f, DEFAULT_INPUTS.get(f, "Unknown"))
-    input_data[f] = form.text_input(f, value=str(defv))
+    submit = st.form_submit_button("Predict")
 
-submit = form.form_submit_button("Predict")
-
-# When user submits
+# Build DataFrame from form inputs (single row)
 if submit:
-    # convert input dict to DataFrame single-row
-    X_user = pd.DataFrame([input_data])
-    # ensure all expected columns exist
-    X_user = ensure_columns_for_predict(X_user, EXPECTED_COLUMNS, defaults=DEFAULT_INPUTS)
+    # create a single-row df from input_values
+    user_row = pd.DataFrame([{k: v for k, v in input_values.items()}])
+    # If expected columns available, prepare types hint by simple heuristics
+    type_hint = {}
+    for c in (expected_cols_clf or expected_cols_reg or []):
+        if any(k in c.lower() for k in ("amount", "salary", "balance", "score", "emi", "rent", "fees", "age", "years", "depend", "size", "tenure")):
+            type_hint[c] = "numeric"
+        else:
+            type_hint[c] = "categorical"
 
-    # Harmonize dtypes for classifier/regressor
-    Xclf = X_user.copy()
-    Xreg = X_user.copy()
-    try:
-        Xclf = harmonize_input_dtypes(Xclf, clf_model)
-    except Exception as e:
-        st.warning(f"Warning while harmonizing classifier input dtypes: {e}")
-    try:
-        Xreg = harmonize_input_dtypes(Xreg, reg_model)
-    except Exception as e:
-        st.warning(f"Warning while harmonizing regressor input dtypes: {e}")
+    # If we lack expected_cols, attempt to use the user's fields only for predictions (best-effort)
+    if expected_cols_clf is None:
+        st.warning("Expected classifier feature list not found. The app will try to predict using only the fields you entered (may fail if pipeline expects more columns).")
+        Xclf = user_row
+    else:
+        Xclf, added = prepare_input_dataframe(user_row, expected_cols_clf, type_hint)
+        if added:
+            st.info(f"Added missing classifier columns with defaults: {added}")
 
-    # Select only expected columns (pipeline expects these columns)
-    # Keep order - sklearn ColumnTransformer expects same names
-    # If pipeline accepts more columns, extras are kept by ensure step.
-    Xclf = Xclf.reindex(columns=[c for c in EXPECTED_COLUMNS if c in Xclf.columns])
-    Xreg = Xreg.reindex(columns=[c for c in EXPECTED_COLUMNS if c in Xreg.columns])
+    if expected_cols_reg is None:
+        Xreg = user_row
+    else:
+        Xreg, added2 = prepare_input_dataframe(user_row, expected_cols_reg, type_hint)
+        if added2:
+            st.info(f"Added missing regressor columns with defaults: {added2}")
 
-    # Prediction
+    # Now run predictions with robust try/except and helpful debug output
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Classifier prediction")
@@ -287,54 +247,79 @@ if submit:
             st.error("Classifier model not loaded.")
         else:
             try:
-                # Make sure we pass a DataFrame to pipeline
+                # Ensure categorical columns are strings to avoid OneHotEncoder isnan errors
+                for c in Xclf.select_dtypes(include=["object"]).columns:
+                    Xclf[c] = Xclf[c].astype(str).fillna("missing")
+                for c in Xclf.columns:
+                    if Xclf[c].dtype == "O":
+                        Xclf[c] = Xclf[c].astype(str)
                 preds = clf_model.predict(Xclf)
+                # Try probabilities
+                probs = None
                 if hasattr(clf_model, "predict_proba"):
-                    probs = clf_model.predict_proba(Xclf)
-                else:
-                    probs = None
-                st.success("Prediction OK")
-                st.write("Predicted label:", preds[0])
+                    try:
+                        probs = clf_model.predict_proba(Xclf)
+                    except Exception:
+                        probs = None
+                st.success("Classifier predicted successfully.")
+                st.write("Prediction:", preds.tolist())
                 if probs is not None:
-                    # show top probabilities if available
-                    probs_df = pd.DataFrame(probs, columns=getattr(clf_model, "classes_", list(range(probs.shape[1]))))
-                    st.write("Predicted probabilities:")
-                    st.dataframe(probs_df.T.rename(columns={0: "prob"}))
+                    st.write("Probabilities:", probs.tolist())
             except Exception as e:
                 st.error("Classifier predict error: see details below.")
-                tb = traceback.format_exc()
-                st.code(tb)
-                # try a best-effort simplified error message
-                st.write("Brief error:", str(e))
-
+                st.exception(e)
+                # brief actionable hint
+                st.info("Hint: If you get 'columns are missing' or dtype errors, upload the processed_final.csv used during training on Admin page or re-export models from training notebook.")
     with col2:
         st.subheader("Regressor prediction")
         if reg_model is None:
             st.error("Regressor model not loaded.")
         else:
             try:
+                for c in Xreg.select_dtypes(include=["object"]).columns:
+                    Xreg[c] = Xreg[c].astype(str).fillna("missing")
                 rpred = reg_model.predict(Xreg)
-                st.success("Regression OK")
-                st.write("Predicted max monthly EMI:", float(rpred[0]))
+                st.success("Regressor predicted successfully.")
+                st.write("Prediction (max monthly EMI):", rpred.tolist())
             except Exception as e:
                 st.error("Regressor predict error: see details below.")
-                tb = traceback.format_exc()
-                st.code(tb)
-                st.write("Brief error:", str(e))
+                st.exception(e)
+                st.info("Hint: If you get 'columns are missing' or dtype errors, upload the processed_final.csv used during training on Admin page or re-export models from training notebook.")
+
+# Admin / debug panel (upload processed_final.csv / upload models)
+st.markdown("---")
+st.header("Admin / debug")
+st.markdown("Upload models (joblib) or `processed_final.csv` used during training to ensure consistent features/dtypes.")
+
+# File upload area for processed_final.csv (recommended to upload)
+uploaded = st.file_uploader("Upload processed_final.csv (optional, will be used to infer expected features/dtypes)", type=["csv"])
+if uploaded is not None:
+    try:
+        df_uploaded = pd.read_csv(uploaded)
+        st.success(f"Uploaded processed sample with {len(df_uploaded.columns)} columns.")
+        # save a copy for app to use
+        save_path = DATA_DIR if DATA_DIR.exists() else BASE
+        outp = Path(save_path) / "processed_final.csv"
+        df_uploaded.to_csv(outp, index=False)
+        st.write("Saved processed_final.csv to", str(outp))
+        # Offer to generate features json
+        if st.button("Export detected columns as models/feature_names.json"):
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            with open(MODELS_DIR / "feature_names.json", "w", encoding="utf-8") as f:
+                json.dump(list(df_uploaded.columns), f, indent=2)
+            st.success("Saved feature list to models/feature_names.json. Re-run the app.")
+    except Exception as e:
+        st.error("Failed to read uploaded CSV.")
+        st.exception(e)
+
+# Small debug info box with model & pipeline details
+with st.expander("Debug: model info"):
+    st.write("Classifier path:", str(CLASSIFIER_PATH))
+    st.write("Regressor path:", str(REGRESSOR_PATH))
+    st.write("Loaded classifier:", type(clf_model).__name__ if clf_model else None)
+    st.write("Loaded regressor:", type(reg_model).__name__ if reg_model else None)
+    st.write("Detected classifier expected cols:", expected_cols_clf)
+    st.write("Detected regressor expected cols:", expected_cols_reg)
 
 st.markdown("---")
-st.info("If you still get dtype/encoder errors: ensure models were trained with the same feature set and dtypes. "
-        "You can re-run the training notebook to re-export models or provide `processed_final.csv` used for training.")
-
-# Developer helper: quick model status dump (collapsed)
-with st.expander("Debug: model info"):
-    st.write("Classifier path:", CLASSIFIER_FNAME)
-    st.write("Regressor path:", REGRESSOR_FNAME)
-    st.write("Loaded classifier:", type(clf_model).__name__ if clf_model is not None else None)
-    st.write("Loaded regressor:", type(reg_model).__name__ if reg_model is not None else None)
-    try:
-        if clf_model is not None and hasattr(clf_model, "named_steps"):
-            st.write("Classifier pipeline steps:", list(clf_model.named_steps.keys()))
-    except Exception:
-        pass
-
+st.write("If prediction still fails: re-run the training notebook and re-export 'best_classifier.joblib' and 'best_regressor.joblib' in the same environment or upload the `processed_final.csv` used for training.")
